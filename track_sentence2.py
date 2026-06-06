@@ -132,7 +132,8 @@ SYSTEM_PROMPT = (
     "Include the track name, artist, album, release year, duration when available, "
     "and musical style/genre from the tags. "
     "Do NOT list tags verbatim; instead weave them into a natural description. "
-    "Output ONLY the sentence, nothing else."
+    "Do NOT output thinking, reasoning, analysis, labels, markdown, or explanations. "
+    "Output ONLY the final sentence, nothing else."
 )
 
 
@@ -280,6 +281,84 @@ def load_model(
     return tokenizer, model
 
 
+def _apply_chat_template_no_thinking(tokenizer, prompt: list[dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            prompt,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            prompt,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+
+def _clean_generated_sentence(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.I | re.S).strip()
+    text = re.sub(r".*</think>", "", text, flags=re.I | re.S).strip()
+
+    final_markers = (
+        r"final answer\s*:",
+        r"final sentence\s*:",
+        r"answer\s*:",
+        r"sentence\s*:",
+    )
+    for marker in final_markers:
+        matches = list(re.finditer(marker, text, flags=re.I))
+        if matches:
+            text = text[matches[-1].end():].strip()
+            break
+
+    lines = []
+    skip_prefixes = (
+        "thinking process",
+        "thought process",
+        "reasoning",
+        "analysis",
+        "final answer",
+        "final sentence",
+        "answer",
+        "sentence",
+    )
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        lowered = line.lower().strip(":： ")
+        if any(lowered.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return ""
+
+    text = lines[0].strip().strip('"')
+    if _is_bad_sentence(text):
+        return ""
+    return text
+
+
+def _is_bad_sentence(sentence: str) -> bool:
+    text = sentence.strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    bad_starts = (
+        "thinking process",
+        "thought process",
+        "reasoning",
+        "analysis",
+        "<think",
+        "</think",
+    )
+    return lowered.startswith(bad_starts)
+
+
 def generate_batch(
     tokenizer,
     model,
@@ -289,7 +368,7 @@ def generate_batch(
 ) -> list[str]:
     """Generate responses for a batch of chat-format prompts."""
     texts = [
-        tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+        _apply_chat_template_no_thinking(tokenizer, p)
         for p in prompts
     ]
     tokenizer_kwargs: dict[str, Any] = {
@@ -318,8 +397,7 @@ def generate_batch(
         input_len = inputs["input_ids"][i].shape[0]
         generated = output[input_len:]
         text = tokenizer.decode(generated, skip_special_tokens=True).strip()
-        # Take first sentence / clean up
-        text = text.split("\n")[0].strip()
+        text = _clean_generated_sentence(text)
         results.append(text)
     return results
 
@@ -365,7 +443,28 @@ def load_checkpoint(checkpoint_path: Path) -> tuple[set[str], list[tuple[str, st
         return set(), []
     with checkpoint_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
-    return set(data["done_ids"]), [tuple(r) for r in data["rows"]]
+
+    valid_rows: list[tuple[str, str]] = []
+    dropped = 0
+    for row in data["rows"]:
+        if len(row) < 2:
+            dropped += 1
+            continue
+        track_id, sentence = str(row[0]), str(row[1])
+        cleaned_sentence = _clean_generated_sentence(sentence)
+        if _is_bad_sentence(cleaned_sentence):
+            dropped += 1
+            continue
+        valid_rows.append((track_id, cleaned_sentence))
+
+    if dropped:
+        print(
+            f"Checkpoint cleanup: dropped {dropped} invalid/thinking rows; "
+            "they will be regenerated."
+        )
+
+    done_ids = {track_id for track_id, _ in valid_rows}
+    return done_ids, valid_rows
 
 
 # =========================================================================
@@ -464,6 +563,7 @@ def main() -> None:
     total_batches = (len(work_items) + args.batch_size - 1) // args.batch_size
     t0 = time.time()
     processed_this_run = 0
+    invalid_this_run = 0
 
     for batch_idx in tqdm(range(total_batches), desc="Generating"):
         start = batch_idx * args.batch_size
@@ -485,6 +585,9 @@ def main() -> None:
         )
 
         for (tid, item, cleaned), sent in zip(batch, sentences):
+            if _is_bad_sentence(sent):
+                invalid_this_run += 1
+                continue
             rows.append((tid, sent))
             done_ids.add(tid)
         processed_this_run += len(batch)
@@ -504,9 +607,15 @@ def main() -> None:
         writer.writerow(["track_id", "sentence"])
         writer.writerows(rows)
 
-    # Clean up checkpoint
-    if checkpoint_path.exists():
+    # Clean up checkpoint only when every attempted track produced a valid sentence.
+    if invalid_this_run == 0 and checkpoint_path.exists():
         checkpoint_path.unlink()
+    elif invalid_this_run:
+        save_checkpoint(checkpoint_path, done_ids, rows)
+        print(
+            f"\nWarning: {invalid_this_run} invalid/thinking outputs were not marked done. "
+            f"Checkpoint kept for another --resume attempt: {checkpoint_path}"
+        )
 
     elapsed = time.time() - t0
     print(f"\nDone! Wrote {len(rows)} rows to: {output_path}")
