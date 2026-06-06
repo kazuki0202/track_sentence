@@ -1,10 +1,10 @@
 """Generate English description sentences for tracks using a Qwen LLM.
 
 Usage:
-    python generate_track_sentences_llm.py                          # defaults
-    python generate_track_sentences_llm.py --model Qwen/Qwen2.5-3B-Instruct
-    python generate_track_sentences_llm.py --model Qwen/Qwen2.5-7B-Instruct --batch-size 64
-    python generate_track_sentences_llm.py --resume   # resume from checkpoint
+    python track_sentence2.py                          # RTX A5000-friendly defaults
+    python track_sentence2.py --model Qwen/Qwen3.5-9B --batch-size 8
+    python track_sentence2.py --load-in-4bit --batch-size 16
+    python track_sentence2.py --resume   # resume from checkpoint
 
 The script:
 1. Loads track metadata from the HuggingFace dataset
@@ -128,7 +128,7 @@ def clean_tags(tags: list[str]) -> list[str]:
 
 SYSTEM_PROMPT = (
     "You are a music metadata writer. Given structured information about a music track, "
-    "write a single concise English sentence (150 words) that naturally describes the track. "
+    "write a single concise English sentence that naturally describes the track. "
     "Include the track name, artist, album, release year, duration when available, "
     "and musical style/genre from the tags. "
     "Do NOT list tags verbatim; instead weave them into a natural description. "
@@ -179,7 +179,7 @@ def _format_duration(value: Any) -> str:
     return f"{minutes}:{seconds:02d}"
 
 
-def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str]) -> str:
+def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str], max_tags: int) -> str:
     track = _listval(item.get("track_name", ""))
     artist = _listval(item.get("artist_name", ""))
     album = _listval(item.get("album_name", ""))
@@ -191,7 +191,8 @@ def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str]) -> str:
         ("duration_ms", "duration", "track_duration_ms", "track_duration", "length_ms", "length"),
     )
     duration_str = _format_duration(duration)
-    tags_str = ", ".join(cleaned_tags) if cleaned_tags else "none"
+    tags = cleaned_tags[:max_tags] if max_tags > 0 else cleaned_tags
+    tags_str = ", ".join(tags) if tags else "none"
 
     return (
         f"Track: {track}\n"
@@ -208,7 +209,32 @@ def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str]) -> str:
 # Inference
 # =========================================================================
 
-def load_model(model_name: str, device: str, dtype: torch.dtype):
+def _dtype_from_name(dtype_name: str) -> torch.dtype:
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    if dtype_name == "float32":
+        return torch.float32
+    return torch.float16
+
+
+def _enable_cuda_fast_math() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
+
+def load_model(
+    model_name: str,
+    device: str,
+    dtype: torch.dtype,
+    attn_implementation: str,
+    load_in_4bit: bool,
+):
     print(f"Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True, padding_side="left",
@@ -216,13 +242,40 @@ def load_model(model_name: str, device: str, dtype: torch.dtype):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading model: {model_name}  (dtype={dtype})")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-        trust_remote_code=True,
-    )
+    _enable_cuda_fast_math()
+
+    print(f"Loading model: {model_name}  (dtype={dtype}, attn={attn_implementation})")
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "device_map": device,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+        "attn_implementation": attn_implementation,
+    }
+
+    if load_in_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "--load-in-4bit requires bitsandbytes and a recent transformers version."
+            ) from exc
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_use_double_quant=True,
+        )
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    except (ImportError, ValueError) as exc:
+        if attn_implementation == "flash_attention_2":
+            print("flash_attention_2 is unavailable; retrying with sdpa.")
+            model_kwargs["attn_implementation"] = "sdpa"
+            model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        else:
+            raise exc
     model.eval()
     return tokenizer, model
 
@@ -249,13 +302,14 @@ def generate_batch(
         tokenizer_kwargs["truncation"] = False
     inputs = tokenizer(texts, **tokenizer_kwargs).to(model.device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            temperature=1.0,
             pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
         )
 
     # Decode only the generated part (skip input tokens)
@@ -268,6 +322,30 @@ def generate_batch(
         text = text.split("\n")[0].strip()
         results.append(text)
     return results
+
+
+def generate_with_auto_split(
+    tokenizer,
+    model,
+    prompts: list[list[dict[str, str]]],
+    max_new_tokens: int,
+    max_input_tokens: int | None,
+) -> list[str]:
+    try:
+        return generate_batch(tokenizer, model, prompts, max_new_tokens, max_input_tokens)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        gc.collect()
+        if len(prompts) == 1:
+            print("OOM on a single prompt; writing an empty sentence for this track.")
+            return [""]
+
+        mid = len(prompts) // 2
+        print(f"\nOOM with batch size {len(prompts)}; retrying as {mid} + {len(prompts) - mid}.")
+        return (
+            generate_with_auto_split(tokenizer, model, prompts[:mid], max_new_tokens, max_input_tokens)
+            + generate_with_auto_split(tokenizer, model, prompts[mid:], max_new_tokens, max_input_tokens)
+        )
 
 
 # =========================================================================
@@ -298,16 +376,23 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate track descriptions with Qwen LLM.")
     p.add_argument("--model", type=str, default="Qwen/Qwen3.5-9B",
                     help="HuggingFace model name (default: Qwen3.5-9B)")
-    p.add_argument("--batch-size", type=int, default=32,
-                    help="Batch size for inference (default: 32)")
-    p.add_argument("--max-new-tokens", type=int, default=150,
-                    help="Max tokens to generate per track (default: 150)")
-    p.add_argument("--max-input-tokens", type=int, default=None,
-                    help="Max prompt tokens before generation (default: no truncation)")
-    p.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16",
-                    help="Model dtype (default: bfloat16)")
+    p.add_argument("--batch-size", type=int, default=8,
+                    help="Batch size for inference (default: 8; RTX A5000 friendly)")
+    p.add_argument("--max-new-tokens", type=int, default=80,
+                    help="Max tokens to generate per track (default: 80)")
+    p.add_argument("--max-input-tokens", type=int, default=512,
+                    help="Max prompt tokens before generation (default: 512)")
+    p.add_argument("--max-tags", type=int, default=24,
+                    help="Max cleaned tags included in each prompt (default: 24)")
+    p.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float16",
+                    help="Model dtype (default: float16; recommended for RTX A5000)")
     p.add_argument("--device", type=str, default="cuda",
-                    help="Device (default: cuda)")
+                    help="Transformers device map (default: cuda)")
+    p.add_argument("--attn-implementation", choices=["sdpa", "flash_attention_2", "eager"],
+                    default="sdpa",
+                    help="Attention implementation (default: sdpa)")
+    p.add_argument("--load-in-4bit", action="store_true",
+                    help="Use bitsandbytes 4-bit quantization to reduce VRAM use")
     p.add_argument("--dataset", type=str,
                     default="talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
     p.add_argument("--output", type=str, default=None,
@@ -329,7 +414,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".ckpt.json")
 
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    dtype = _dtype_from_name(args.dtype)
 
     # --- Load data ---
     print("Loading track metadata...")
@@ -367,11 +452,18 @@ def main() -> None:
         return
 
     # --- Load model ---
-    tokenizer, model = load_model(args.model, args.device, dtype)
+    tokenizer, model = load_model(
+        args.model,
+        args.device,
+        dtype,
+        args.attn_implementation,
+        args.load_in_4bit,
+    )
 
     # --- Batch inference ---
     total_batches = (len(work_items) + args.batch_size - 1) // args.batch_size
     t0 = time.time()
+    processed_this_run = 0
 
     for batch_idx in tqdm(range(total_batches), desc="Generating"):
         start = batch_idx * args.batch_size
@@ -381,43 +473,29 @@ def main() -> None:
         # Build prompts
         prompts = []
         for tid, item, cleaned in batch:
-            user_msg = build_user_prompt(item, cleaned)
+            user_msg = build_user_prompt(item, cleaned, args.max_tags)
             prompts.append([
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
             ])
 
         # Generate
-        try:
-            sentences = generate_batch(
-                tokenizer, model, prompts, args.max_new_tokens, args.max_input_tokens
-            )
-        except torch.cuda.OutOfMemoryError:
-            print(f"\nOOM at batch {batch_idx}. Reducing batch, retrying one by one...")
-            torch.cuda.empty_cache()
-            gc.collect()
-            sentences = []
-            for p in prompts:
-                try:
-                    s = generate_batch(
-                        tokenizer, model, [p], args.max_new_tokens, args.max_input_tokens
-                    )
-                    sentences.append(s[0])
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    sentences.append("")
+        sentences = generate_with_auto_split(
+            tokenizer, model, prompts, args.max_new_tokens, args.max_input_tokens
+        )
 
         for (tid, item, cleaned), sent in zip(batch, sentences):
             rows.append((tid, sent))
             done_ids.add(tid)
+        processed_this_run += len(batch)
 
         # Checkpoint
         if (batch_idx + 1) % args.checkpoint_every == 0:
             save_checkpoint(checkpoint_path, done_ids, rows)
             elapsed = time.time() - t0
-            speed = len(done_ids) / elapsed
-            eta = (len(work_items) - len(done_ids)) / speed if speed > 0 else 0
-            print(f"\n  Checkpoint saved. {len(done_ids)}/{len(work_items)} done. "
+            speed = processed_this_run / elapsed
+            eta = (len(work_items) - processed_this_run) / speed if speed > 0 else 0
+            print(f"\n  Checkpoint saved. {processed_this_run}/{len(work_items)} done this run. "
                   f"Speed: {speed:.1f} tracks/s, ETA: {eta/60:.1f} min")
 
     # --- Write CSV ---

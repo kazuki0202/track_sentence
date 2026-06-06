@@ -24,3 +24,15 @@ Fallback to the original Transformers backend:
 ```bash
 python track_sentence.py --backend transformers --batch-size 32
 ```
+
+RTX A5000 / no-vLLM path:
+
+```bash
+python track_sentence2.py --model Qwen/Qwen3.5-9B --batch-size 8 --resume
+```
+
+If 24GB VRAM is still tight, use 4-bit quantization:
+
+```bash
+python track_sentence2.py --model Qwen/Qwen3.5-9B --load-in-4bit --batch-size 16 --resume
+```
