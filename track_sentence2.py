@@ -130,7 +130,7 @@ def clean_tags(tags: list[str]) -> list[str]:
 SYSTEM_PROMPT = (
     "You are a music metadata writer. Given structured information about a music track, "
     "write a single concise English sentence that naturally describes the track. "
-    "Include the track name, artist, album, release year, duration when available, "
+    "Include the track name, artist, album, release year, approximate length when available, "
     "and musical style/genre from the tags. "
     "Do NOT list tags verbatim; instead weave them into a natural description. "
     "Do NOT output thinking, reasoning, analysis, labels, markdown, or explanations. "
@@ -152,33 +152,47 @@ def _first_existing(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
-def _format_duration(value: Any) -> str:
+def _duration_to_seconds(value: Any) -> int | None:
     value = _listval(value)
     if not value:
-        return "unknown"
+        return None
 
     if isinstance(value, str):
         value = value.strip()
         if not value:
-            return "unknown"
+            return None
         if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", value):
-            return value
+            parts = [int(part) for part in value.split(":")]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
         try:
             duration = float(value)
         except ValueError:
-            return value
+            return None
     else:
         duration = float(value)
 
     if duration <= 0 or duration != duration:
+        return None
+
+    return int(round(duration / 1000 if duration > 10000 else duration))
+
+
+def _duration_category(value: Any) -> str:
+    seconds = _duration_to_seconds(value)
+    if seconds is None:
         return "unknown"
 
-    seconds = int(round(duration / 1000 if duration > 10000 else duration))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    return f"{minutes}:{seconds:02d}"
+    if seconds < 120:
+        return "very short"
+    if seconds < 180:
+        return "short"
+    if seconds < 300:
+        return "medium length"
+    if seconds < 420:
+        return "long"
+    return "very long"
 
 
 def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str], max_tags: int) -> str:
@@ -192,7 +206,7 @@ def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str], max_tags: i
         item,
         ("duration_ms", "duration", "track_duration_ms", "track_duration", "length_ms", "length"),
     )
-    duration_str = _format_duration(duration)
+    duration_label = _duration_category(duration)
     tags = cleaned_tags[:max_tags] if max_tags > 0 else cleaned_tags
     tags_str = ", ".join(tags) if tags else "none"
 
@@ -201,7 +215,7 @@ def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str], max_tags: i
         f"Artist: {artist}\n"
         f"Album: {album}\n"
         f"Release year: {release}\n"
-        f"Duration: {duration_str}\n"
+        f"Duration category: {duration_label}\n"
         f"Popularity: {pop_str}\n"
         f"Tags: {tags_str}"
     )
