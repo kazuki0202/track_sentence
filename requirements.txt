@@ -1,0 +1,13 @@
+# track_sentence2.py runtime dependencies.
+#
+# For an RTX A5000 CUDA environment, install the PyTorch wheel that matches your
+# CUDA runtime first if plain pip resolution does not pick the right build.
+
+torch>=2.5.1
+transformers>=4.46.3
+accelerate>=0.26.0
+datasets>=3.1.0
+tqdm>=4.65.0
+
+# Optional: required only when running track_sentence2.py with --load-in-4bit.
+bitsandbytes>=0.43.0; platform_system != "Windows"
