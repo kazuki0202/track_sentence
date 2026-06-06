@@ -1,10 +1,10 @@
 """Generate English description sentences for tracks using a Qwen LLM.
 
 Usage:
-    python generate_track_sentences_llm.py                          # defaults
-    python generate_track_sentences_llm.py --model Qwen/Qwen2.5-3B-Instruct
-    python generate_track_sentences_llm.py --model Qwen/Qwen2.5-7B-Instruct --batch-size 64
-    python generate_track_sentences_llm.py --resume   # resume from checkpoint
+    python track_sentence.py                                        # defaults
+    python track_sentence.py --model Qwen/Qwen2.5-3B-Instruct
+    python track_sentence.py --model Qwen/Qwen2.5-7B-Instruct --batch-size 64
+    python track_sentence.py --backend transformers --resume
 
 The script:
 1. Loads track metadata from the HuggingFace dataset
@@ -29,7 +29,7 @@ from typing import Any
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 # =========================================================================
 # Tag filtering
@@ -208,7 +208,15 @@ def build_user_prompt(item: dict[str, Any], cleaned_tags: list[str]) -> str:
 # Inference
 # =========================================================================
 
-def load_model(model_name: str, device: str, dtype: torch.dtype):
+def _dtype_to_torch(dtype_name: str) -> torch.dtype:
+    return torch.bfloat16 if dtype_name == "bfloat16" else torch.float16
+
+
+def _dtype_to_vllm(dtype_name: str) -> str:
+    return "bfloat16" if dtype_name == "bfloat16" else "float16"
+
+
+def load_transformers_model(model_name: str, device: str, dtype: torch.dtype):
     print(f"Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True, padding_side="left",
@@ -216,7 +224,9 @@ def load_model(model_name: str, device: str, dtype: torch.dtype):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading model: {model_name}  (dtype={dtype})")
+    print(f"Loading Transformers model: {model_name}  (dtype={dtype})")
+    from transformers import AutoModelForCausalLM
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
@@ -227,7 +237,51 @@ def load_model(model_name: str, device: str, dtype: torch.dtype):
     return tokenizer, model
 
 
-def generate_batch(
+def load_vllm_model(
+    model_name: str,
+    dtype_name: str,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    max_model_len: int | None,
+):
+    try:
+        from vllm import LLM
+    except ImportError as exc:
+        raise RuntimeError(
+            "vLLM is not installed. Install it with a CUDA-compatible environment, "
+            "or run with --backend transformers."
+        ) from exc
+
+    print(f"Loading vLLM model: {model_name}  (dtype={dtype_name})")
+    kwargs: dict[str, Any] = {
+        "model": model_name,
+        "dtype": _dtype_to_vllm(dtype_name),
+        "trust_remote_code": True,
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_memory_utilization,
+    }
+    if max_model_len is not None:
+        kwargs["max_model_len"] = max_model_len
+
+    llm = LLM(**kwargs)
+    tokenizer = llm.get_tokenizer()
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer, llm
+
+
+def _build_chat_texts(tokenizer, prompts: list[list[dict[str, str]]]) -> list[str]:
+    return [
+        tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
+        for p in prompts
+    ]
+
+
+def _clean_generation(text: str) -> str:
+    return text.split("\n")[0].strip()
+
+
+def generate_batch_transformers(
     tokenizer,
     model,
     prompts: list[list[dict[str, str]]],
@@ -235,10 +289,7 @@ def generate_batch(
     max_input_tokens: int | None = None,
 ) -> list[str]:
     """Generate responses for a batch of chat-format prompts."""
-    texts = [
-        tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
-        for p in prompts
-    ]
+    texts = _build_chat_texts(tokenizer, prompts)
     tokenizer_kwargs: dict[str, Any] = {
         "return_tensors": "pt",
         "padding": True,
@@ -265,9 +316,35 @@ def generate_batch(
         generated = output[input_len:]
         text = tokenizer.decode(generated, skip_special_tokens=True).strip()
         # Take first sentence / clean up
-        text = text.split("\n")[0].strip()
+        text = _clean_generation(text)
         results.append(text)
     return results
+
+
+def generate_batch_vllm(
+    tokenizer,
+    llm,
+    prompts: list[list[dict[str, str]]],
+    max_new_tokens: int = 150,
+    max_input_tokens: int | None = None,
+) -> list[str]:
+    """Generate responses for a batch of chat-format prompts with vLLM."""
+    from vllm import SamplingParams
+
+    texts = _build_chat_texts(tokenizer, prompts)
+    sampling_kwargs: dict[str, Any] = {
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0,
+    }
+    if max_input_tokens is not None:
+        sampling_kwargs["truncate_prompt_tokens"] = max_input_tokens
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+    outputs = llm.generate(texts, sampling_params, use_tqdm=False)
+    return [
+        _clean_generation(output.outputs[0].text.strip()) if output.outputs else ""
+        for output in outputs
+    ]
 
 
 # =========================================================================
@@ -298,6 +375,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate track descriptions with Qwen LLM.")
     p.add_argument("--model", type=str, default="Qwen/Qwen3.5-9B",
                     help="HuggingFace model name (default: Qwen3.5-9B)")
+    p.add_argument("--backend", choices=["vllm", "transformers"], default="vllm",
+                    help="Inference backend (default: vllm)")
     p.add_argument("--batch-size", type=int, default=32,
                     help="Batch size for inference (default: 32)")
     p.add_argument("--max-new-tokens", type=int, default=150,
@@ -307,7 +386,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16",
                     help="Model dtype (default: bfloat16)")
     p.add_argument("--device", type=str, default="cuda",
-                    help="Device (default: cuda)")
+                    help="Transformers device map (default: cuda; ignored by vLLM)")
+    p.add_argument("--tensor-parallel-size", type=int, default=1,
+                    help="vLLM tensor parallel size (default: 1)")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.90,
+                    help="vLLM GPU memory utilization ratio (default: 0.90)")
+    p.add_argument("--max-model-len", type=int, default=None,
+                    help="vLLM max model length override (default: model config)")
     p.add_argument("--dataset", type=str,
                     default="talkpl-ai/TalkPlayData-Challenge-Track-Metadata")
     p.add_argument("--output", type=str, default=None,
@@ -329,7 +414,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path.with_suffix(".ckpt.json")
 
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    dtype = _dtype_to_torch(args.dtype)
 
     # --- Load data ---
     print("Loading track metadata...")
@@ -367,11 +452,23 @@ def main() -> None:
         return
 
     # --- Load model ---
-    tokenizer, model = load_model(args.model, args.device, dtype)
+    if args.backend == "vllm":
+        tokenizer, model = load_vllm_model(
+            args.model,
+            args.dtype,
+            args.tensor_parallel_size,
+            args.gpu_memory_utilization,
+            args.max_model_len,
+        )
+        generate_batch_fn = generate_batch_vllm
+    else:
+        tokenizer, model = load_transformers_model(args.model, args.device, dtype)
+        generate_batch_fn = generate_batch_transformers
 
     # --- Batch inference ---
     total_batches = (len(work_items) + args.batch_size - 1) // args.batch_size
     t0 = time.time()
+    processed_this_run = 0
 
     for batch_idx in tqdm(range(total_batches), desc="Generating"):
         start = batch_idx * args.batch_size
@@ -389,7 +486,7 @@ def main() -> None:
 
         # Generate
         try:
-            sentences = generate_batch(
+            sentences = generate_batch_fn(
                 tokenizer, model, prompts, args.max_new_tokens, args.max_input_tokens
             )
         except torch.cuda.OutOfMemoryError:
@@ -399,7 +496,7 @@ def main() -> None:
             sentences = []
             for p in prompts:
                 try:
-                    s = generate_batch(
+                    s = generate_batch_fn(
                         tokenizer, model, [p], args.max_new_tokens, args.max_input_tokens
                     )
                     sentences.append(s[0])
@@ -410,14 +507,15 @@ def main() -> None:
         for (tid, item, cleaned), sent in zip(batch, sentences):
             rows.append((tid, sent))
             done_ids.add(tid)
+        processed_this_run += len(batch)
 
         # Checkpoint
         if (batch_idx + 1) % args.checkpoint_every == 0:
             save_checkpoint(checkpoint_path, done_ids, rows)
             elapsed = time.time() - t0
-            speed = len(done_ids) / elapsed
-            eta = (len(work_items) - len(done_ids)) / speed if speed > 0 else 0
-            print(f"\n  Checkpoint saved. {len(done_ids)}/{len(work_items)} done. "
+            speed = processed_this_run / elapsed
+            eta = (len(work_items) - processed_this_run) / speed if speed > 0 else 0
+            print(f"\n  Checkpoint saved. {processed_this_run}/{len(work_items)} done this run. "
                   f"Speed: {speed:.1f} tracks/s, ETA: {eta/60:.1f} min")
 
     # --- Write CSV ---
