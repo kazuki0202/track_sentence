@@ -4,6 +4,7 @@ Usage:
     python track_sentence2.py                          # RTX A5000-friendly defaults
     python track_sentence2.py --model Qwen/Qwen3.5-9B --batch-size 8
     python track_sentence2.py --load-in-4bit --batch-size 16
+    python track_sentence2.py --test-output --test-output-count 8
     python track_sentence2.py --resume   # resume from checkpoint
 
 The script:
@@ -502,6 +503,12 @@ def parse_args() -> argparse.Namespace:
                     help="Resume from checkpoint if available")
     p.add_argument("--max-tracks", type=int, default=None,
                     help="Process only first N tracks (for testing)")
+    p.add_argument("--test-output", action="store_true",
+                    help="Generate a small output sample without touching the main CSV/checkpoint")
+    p.add_argument("--test-output-count", type=int, default=8,
+                    help="Number of tracks to generate in --test-output mode (default: 8)")
+    p.add_argument("--test-output-file", type=str, default=None,
+                    help="Output CSV path for --test-output mode (default: data/track_sentences_test.csv)")
     return p.parse_args()
 
 
@@ -530,9 +537,11 @@ def main() -> None:
     # --- Resume ---
     done_ids: set[str] = set()
     rows: list[tuple[str, str]] = []
-    if args.resume:
+    if args.resume and not args.test_output:
         done_ids, rows = load_checkpoint(checkpoint_path)
         print(f"Resumed from checkpoint: {len(done_ids)} tracks already processed")
+    elif args.resume and args.test_output:
+        print("--test-output mode ignores --resume and does not read or write the main checkpoint.")
 
     # --- Prepare work items ---
     work_items: list[tuple[str, dict, list[str]]] = []
@@ -544,6 +553,8 @@ def main() -> None:
         work_items.append((tid, item, cleaned))
     if args.max_tracks:
         work_items = work_items[:args.max_tracks]
+    if args.test_output:
+        work_items = work_items[:args.test_output_count]
     print(f"Tracks to process: {len(work_items)}")
 
     if not work_items:
@@ -558,6 +569,49 @@ def main() -> None:
         args.attn_implementation,
         args.load_in_4bit,
     )
+
+    if args.test_output:
+        test_output_path = (
+            Path(args.test_output_file)
+            if args.test_output_file
+            else script_dir / "data" / "track_sentences_test.csv"
+        )
+        test_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        prompts = []
+        for tid, item, cleaned in work_items:
+            user_msg = build_user_prompt(item, cleaned, args.max_tags)
+            prompts.append([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ])
+
+        t0 = time.time()
+        sentences = generate_with_auto_split(
+            tokenizer, model, prompts, args.max_new_tokens, args.max_input_tokens
+        )
+
+        test_rows: list[tuple[str, str, str]] = []
+        invalid_count = 0
+        print("\n--- Test Output ---")
+        for (tid, item, cleaned), sent in zip(work_items, sentences):
+            is_valid = not _is_bad_sentence(sent)
+            if not is_valid:
+                invalid_count += 1
+            test_rows.append((tid, sent, "yes" if is_valid else "no"))
+            print(f"\n[{tid}] valid={'yes' if is_valid else 'no'}")
+            print(f"  {sent}")
+
+        with test_output_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["track_id", "sentence", "valid"])
+            writer.writerows(test_rows)
+
+        elapsed = time.time() - t0
+        print(f"\nTest done. Wrote {len(test_rows)} rows to: {test_output_path}")
+        print(f"Invalid/thinking rows: {invalid_count}")
+        print(f"Total time: {elapsed:.1f} sec")
+        return
 
     # --- Batch inference ---
     total_batches = (len(work_items) + args.batch_size - 1) // args.batch_size
